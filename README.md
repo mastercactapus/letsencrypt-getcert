@@ -20,9 +20,12 @@ You will need to temporarily make port 80 available and have sudo/root access to
 
 ```bash
 
-letsencrypt-getcert generate example.com
+letsencrypt-getcert generate --chain example.com
 # example.com.crt.pem and example.com.key.pem should be in the current directory
 ```
+
+You can now move and/or reference `example.com.crt.pem` and `example.com.key.pem` from your TLS services.
+
 
 ### Using an existing CSR
 
@@ -33,6 +36,7 @@ When using an existing CSR, the tool will automatically use the CommonName, so t
 letsencrypt-getcert sign ./example.csr
 # example.com.crt.pem should be in the current directory
 ```
+
 
 ### Advanced
 
