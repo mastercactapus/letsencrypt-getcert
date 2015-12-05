@@ -4,18 +4,27 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
 	"github.com/ericchiang/letsencrypt"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const acmeURL = "https://acme-v01.api.letsencrypt.org/directory"
 
 // const acmeURL = "http://localhost:4000/directory"
+
+var chainURLs = []string{
+	"https://letsencrypt.org/certs/lets-encrypt-x1-cross-signed.pem",
+	"https://letsencrypt.org/certs/lets-encrypt-x2-cross-signed.pem",
+	"https://letsencrypt.org/certs/letsencryptauthorityx1.pem",
+	"https://letsencrypt.org/certs/letsencryptauthorityx2.pem",
+	"https://letsencrypt.org/certs/isrgrootx1.pem",
+}
 
 var supportedChallengs = []string{
 	letsencrypt.ChallengeHTTP,
@@ -27,6 +36,8 @@ type Config struct {
 	outputDir   string
 	keyFile     string
 	bits        int
+	chain       bool
+	chainData   []byte
 }
 
 type Client struct {
@@ -57,7 +68,40 @@ func init() {
 	mainCmd.PersistentFlags().StringP("output-dir", "d", ".", "Output directory. Certificates and keys will be stored here.")
 	mainCmd.PersistentFlags().StringP("account-key", "k", "acme.key", "ACME account key (PEM format). The account key to use with this CA. If it doesn't exist, one will be generated.")
 	mainCmd.PersistentFlags().Int("bits", 4096, "Bits for RSA key generation.")
+	mainCmd.PersistentFlags().Bool("chain", false, "Include full chain. If set, download and include all LE certificates in the chain.")
 	// log.SetLevel(log.DebugLevel)
+}
+
+func getChain() []byte {
+	certs := make([][]byte, len(chainURLs))
+	var wg sync.WaitGroup
+	for i, url := range chainURLs {
+		wg.Add(1)
+		go func(i int, url string) {
+			defer wg.Done()
+			resp, err := http.Get(url)
+			if err != nil {
+				log.Fatalln(err)
+				return
+			}
+			defer resp.Body.Close()
+			data, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				log.Fatalln(err)
+				return
+			}
+			certs[i] = data
+		}(i, url)
+	}
+	wg.Wait()
+	result := make([]byte, 0, 1024*1024)
+	for _, data := range certs {
+		result = append(result, data...)
+		if result[len(result)-1] != 10 {
+			result = append(result, 10)
+		}
+	}
+	return result
 }
 
 func getConfig(cmd *cobra.Command) (*Config, error) {
@@ -81,7 +125,14 @@ func getConfig(cmd *cobra.Command) (*Config, error) {
 	}
 	c.bits, err = cmd.Flags().GetInt("bits")
 	if err != nil {
-		return nil, fmt.Errorf("invalid value for bits: %s", err.Error())
+		return nil, err
+	}
+	c.chain, err = cmd.Flags().GetBool("chain")
+	if err != nil {
+		return nil, err
+	}
+	if c.chain {
+		c.chainData = getChain()
 	}
 	return &c, nil
 }
@@ -150,6 +201,9 @@ func runGen(cmd *cobra.Command, args []string) {
 		}
 
 		data = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+		if c.chain {
+			data = append(data, c.chainData...)
+		}
 		err = ioutil.WriteFile(certFile, data, 0600)
 		if err != nil {
 			log.Fatalln(err)
@@ -197,8 +251,11 @@ func runSign(cmd *cobra.Command, args []string) {
 			log.Fatalln(err)
 		}
 
-		b = &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}
-		err = ioutil.WriteFile(certFile, pem.EncodeToMemory(b), 0600)
+		data = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+		if c.chain {
+			data = append(data, c.chainData...)
+		}
+		err = ioutil.WriteFile(certFile, data, 0600)
 		if err != nil {
 			log.Fatalln(err)
 		}
