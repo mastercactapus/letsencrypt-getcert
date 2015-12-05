@@ -13,9 +13,9 @@ import (
 	"path/filepath"
 )
 
-// const acmeURL = "https://acme-v01.api.letsencrypt.org/directory"
+const acmeURL = "https://acme-v01.api.letsencrypt.org/directory"
 
-const acmeURL = "http://localhost:4000/directory"
+// const acmeURL = "http://localhost:4000/directory"
 
 var supportedChallengs = []string{
 	letsencrypt.ChallengeHTTP,
