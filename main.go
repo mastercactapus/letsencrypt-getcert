@@ -1,28 +1,38 @@
 package main
 
 import (
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"github.com/ericchiang/letsencrypt"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"io"
 	"io/ioutil"
-	"net"
-	"net/http"
 	"os"
-	"sync"
+	"path/filepath"
 )
 
-const acmeURL = "https://acme-v01.api.letsencrypt.org/directory"
+// const acmeURL = "https://acme-v01.api.letsencrypt.org/directory"
 
-// const acmeURL = "http://localhost:4000/directory"
+const acmeURL = "http://localhost:4000/directory"
 
 var supportedChallengs = []string{
 	letsencrypt.ChallengeHTTP,
+}
+
+type Config struct {
+	bindAddress string
+	acmeURL     string
+	outputDir   string
+	keyFile     string
+	bits        int
+}
+
+type Client struct {
+	*letsencrypt.Client
+	*HTTPChallengeResponder
+	accountKey *rsa.PrivateKey
 }
 
 var (
@@ -42,210 +52,158 @@ var (
 )
 
 func init() {
-	mainCmd.PersistentFlags().StringP("bind", "b", ":80", "Bind address. The binding addres:port for the server. Note, port 80 on the domain(s) must be mapped to this address.")
+	mainCmd.PersistentFlags().StringP("bind", "b", ":80", "Bind address. The binding address:port for the server. Note, port 80 on the domain(s) must be mapped to this address.")
 	mainCmd.PersistentFlags().StringP("acme-url", "u", acmeURL, "ACME URL. URL to the ACME directory to use.")
-	mainCmd.PersistentFlags().StringP("output", "o", "-", "Output file. The signed certificate will be saved here. If set to -, stdout will be used. (the default)")
+	mainCmd.PersistentFlags().StringP("output-dir", "d", ".", "Output directory. Certificates and keys will be stored here.")
 	mainCmd.PersistentFlags().StringP("account-key", "k", "acme.key", "ACME account key (PEM format). The account key to use with this CA. If it doesn't exist, one will be generated.")
-	log.SetLevel(log.DebugLevel)
+	mainCmd.PersistentFlags().Int("bits", 4096, "Bits for RSA key generation.")
+	// log.SetLevel(log.DebugLevel)
 }
 
-type HTTPChallengeResponder struct {
-	net.Listener
-	*sync.RWMutex
-	path, resource string
-}
-
-func NewHTTPChallengeResponder(address string) (*HTTPChallengeResponder, error) {
-	l, err := net.Listen("tcp", address)
+func getConfig(cmd *cobra.Command) (*Config, error) {
+	var err error
+	var c Config
+	c.acmeURL, err = cmd.Flags().GetString("acme-url")
 	if err != nil {
 		return nil, err
 	}
-	h := &HTTPChallengeResponder{
-		Listener: l,
-		RWMutex:  new(sync.RWMutex),
+	c.keyFile, err = cmd.Flags().GetString("account-key")
+	if err != nil {
+		return nil, err
 	}
-	log.Debugln("Listening on", address)
-	go http.Serve(l, h)
-	return h, nil
-}
-func (h *HTTPChallengeResponder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.RLock()
-	defer h.RUnlock()
-	if r.URL.Path != h.path {
-		log.WithFields(log.Fields{"host": r.Host, "path": r.URL.Path}).Warnln("Bad Request")
-		http.NotFound(w, r)
-		return
+	c.bindAddress, err = cmd.Flags().GetString("bind")
+	if err != nil {
+		return nil, err
 	}
-	log.WithFields(log.Fields{"host": r.Host, "path": r.URL.Path}).Infoln("Success")
-
-	io.WriteString(w, h.resource)
-}
-func (h *HTTPChallengeResponder) SetResource(path, resource string) {
-	h.Lock()
-	defer h.Unlock()
-	log.WithFields(log.Fields{"path": path, "resource": resource}).Debugln("SetResource")
-	h.path = path
-	h.resource = resource
+	c.outputDir, err = cmd.Flags().GetString("output-dir")
+	if err != nil {
+		return nil, err
+	}
+	c.bits, err = cmd.Flags().GetInt("bits")
+	if err != nil {
+		return nil, fmt.Errorf("invalid value for bits: %s", err.Error())
+	}
+	return &c, nil
 }
 
-func newCSR(domain string) (*x509.CertificateRequest, *rsa.PrivateKey, error) {
-	log.WithField("domain", domain).Debugln("Generating 4096-bit RSA key")
-	certKey, err := rsa.GenerateKey(rand.Reader, 4096)
+func (c *Config) getClient() (*Client, error) {
+
+	lcli, err := letsencrypt.NewClient(c.acmeURL)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	template := &x509.CertificateRequest{
-		SignatureAlgorithm: x509.SHA256WithRSA,
-		PublicKeyAlgorithm: x509.RSA,
-		PublicKey:          &certKey.PublicKey,
-		Subject:            pkix.Name{CommonName: domain},
-		DNSNames:           []string{domain},
-	}
-	log.WithField("domain", domain).Debugln("Generating CSR for:", domain)
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, certKey)
+
+	os.MkdirAll(c.outputDir, 0700)
+	accountKey, err := getAccountKey(lcli, c.keyFile, c.bits)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	csr, err := x509.ParseCertificateRequest(csrDER)
+
+	h, err := NewHTTPChallengeResponder(c.bindAddress)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return csr, certKey, nil
+
+	return &Client{Client: lcli, accountKey: accountKey, HTTPChallengeResponder: h}, nil
+}
+func fileExists(file string) bool {
+	_, err := os.Stat(file)
+	// no error, or error is not a "NotExist" error
+	// then file exists
+	return err == nil || !os.IsNotExist(err)
 }
 
 func runGen(cmd *cobra.Command, args []string) {
-	url, err := cmd.Flags().GetString("acme-url")
-	if err != nil {
-		panic(err)
-	}
-	keyFile, err := cmd.Flags().GetString("account-key")
-	if err != nil {
-		panic(err)
-	}
-	bindAddr, err := cmd.Flags().GetString("bind")
-	if err != nil {
-		panic(err)
-	}
-	outPath, err := cmd.Flags().GetString("output")
-	if err != nil {
-		panic(err)
-	}
-
-	var out io.Writer
-	if outPath == "-" {
-		out = os.Stdout
-	} else {
-		out, err = os.OpenFile(outPath, os.O_CREATE|os.O_EXCL, 0600)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		defer out.(io.Closer).Close()
-	}
-
-	cli, err := letsencrypt.NewClient(url)
+	c, err := getConfig(cmd)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	var accountKey *rsa.PrivateKey
-	if _, err := os.Stat(keyFile); os.IsNotExist(err) {
-		log.Debugln("Generating new account key")
-		accountKey, err = rsa.GenerateKey(rand.Reader, 4096)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		if _, err = cli.NewRegistration(accountKey); err != nil {
-			log.Fatalln("new registration failed:", err)
-		}
-		b := &pem.Block{
-			Bytes: x509.MarshalPKCS1PrivateKey(accountKey),
-			Type:  "ACME Account Key",
-		}
-		pemData := pem.EncodeToMemory(b)
-		err = ioutil.WriteFile(keyFile, pemData, 0600)
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}
-
-	if accountKey == nil {
-		pemData, err := ioutil.ReadFile(keyFile)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		b, _ := pem.Decode(pemData)
-		if b.Type != "ACME Account Key" {
-			log.Fatalln("Invalid account key type:", b.Type)
-		}
-		accountKey, err = x509.ParsePKCS1PrivateKey(b.Bytes)
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}
-
-	h, err := NewHTTPChallengeResponder(bindAddr)
+	cli, err := c.getClient()
 	if err != nil {
 		log.Fatalln(err)
 	}
 
 	for _, domain := range args {
-		log.Infoln("Generating certificate for:", domain)
+		certFile := filepath.Join(c.outputDir, domain+".crt.pem")
+		keyFile := filepath.Join(c.outputDir, domain+".key.pem")
+		if fileExists(certFile) || fileExists(keyFile) {
+			log.Warnln("skip: cert and/or key exists for " + domain)
+			continue
+		}
 
 		l := log.WithField("domain", domain)
-		csr, key, err := newCSR(domain)
+		csr, key, err := newCSR(domain, c.bits)
 		if err != nil {
 			l.Fatalln("certificate generation failed:", err)
 		}
-		l.Debug("asking for challenges")
-		auth, _, err := cli.NewAuthorization(accountKey, "dns", domain)
-		if err != nil {
-			l.Fatalln(err)
-		}
-		chals := auth.Combinations(supportedChallengs...)
-		if len(chals) == 0 {
-			l.Fatalln("no supported challenge combinations")
-		}
 
-		for _, chal := range chals {
-			for _, chal := range chal {
-				l.Debug("challenge:", chal.Type)
-				if chal.Type != letsencrypt.ChallengeHTTP {
-					log.Fatalln("unsupported challenge type was requested")
-				}
-				path, resource, err := chal.HTTP(accountKey)
-				if err != nil {
-					l.Fatalln(err)
-				}
-				h.SetResource(path, resource)
-				err = cli.ChallengeReady(accountKey, chal)
-				if err != nil {
-					l.Fatalln(err)
-				}
-			}
-		}
-
-		cert, err := cli.NewCertificate(accountKey, csr)
-		if err != nil {
-			l.Fatalln(err)
-		}
-		err = pem.Encode(out, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+		cert, err := cli.fulfilCSR(csr)
 		if err != nil {
 			l.Fatalln(err)
 		}
 
-		err = pem.Encode(out, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+		data := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+		err = ioutil.WriteFile(keyFile, data, 0600)
 		if err != nil {
-			l.Fatalln(err)
+			log.Fatalln(err)
 		}
 
+		data = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+		err = ioutil.WriteFile(certFile, data, 0600)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		log.Infoln("Generated certificate for:", domain)
 	}
 }
 func runSign(cmd *cobra.Command, args []string) {
+	c, err := getConfig(cmd)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
-}
+	cli, err := c.getClient()
+	if err != nil {
+		log.Fatalln(err)
+	}
 
-func fulfill(csr *x509.CertificateRequest) error {
-	return nil
+	for _, csrFile := range args {
+		data, err := ioutil.ReadFile(csrFile)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		b, _ := pem.Decode(data)
+		var csr *x509.CertificateRequest
+		if b == nil {
+			csr, err = x509.ParseCertificateRequest(data)
+		} else {
+			csr, err = x509.ParseCertificateRequest(b.Bytes)
+		}
+		if err != nil {
+			log.Warnln("couldn't parse '"+csrFile+"':", err)
+			continue
+		}
+
+		certFile := filepath.Join(c.outputDir, csr.Subject.CommonName+".crt.pem")
+		if fileExists(certFile) {
+			log.Warnln("skip: cert exists for " + csr.Subject.CommonName)
+			continue
+		}
+
+		cert, err := cli.fulfilCSR(csr)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		b = &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}
+		err = ioutil.WriteFile(certFile, pem.EncodeToMemory(b), 0600)
+		if err != nil {
+			log.Fatalln(err)
+		}
+		log.Infoln("Generated certificate for:", csr.Subject.CommonName)
+	}
 }
 
 func main() {
